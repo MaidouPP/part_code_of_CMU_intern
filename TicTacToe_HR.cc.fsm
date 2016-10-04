@@ -1,0 +1,1632 @@
+#include <vector>
+#include "Behaviors/StateMachine.h"
+#include "tic-tac-toe/TTTState.h"
+#include "tic-tac-toe/TTTCommentaryNode.h"
+
+$nodeclass TicTacToe_HR {
+	static const int AI_DIFFICULTY = 92; // [0~100]
+	static const int CLOSE_DISTANCE_TOLERANCE = 150;
+	static const int WAIT_PLAYER_MOVE_TIME = 13000;
+
+	enum Turn {PlayerTurn, RobotTurn, GameEnd};
+	enum BoardPiece {None, OPiece, XPiece};
+	enum PlayerMoveChange {ValidMove, InvalidMove, NoMove, NoPieces};
+
+	struct BoardInfo;
+	struct BoardState;
+
+	$provide int counter_1;
+	$provide int counter_2;
+
+	// Board State metadata
+	$provide Turn currentTurn;
+	$provide BoardPiece playerPiece;
+	$provide std::vector<std::vector<BoardPiece> > board;
+	$provide int last_i;
+	$provide int last_j;
+	$provide int last_player_i;
+	$provide int last_player_j;
+	$provide BoardInfo boardInfo;
+	$provide BoardState boardState;
+	$provide Location newPiece;
+	$provide float gridLen;
+
+	// Board Parsing metadata
+	$provide std::vector<Shape<PolygonData> > squares;
+	$provide std::vector<Shape<LineData> > boardlines;
+	$provide valarray<uint> sks;
+
+	$provide std::string const lineColor("red");
+	$provide std::string const xColor("red");
+	$provide std::string const oColor("red");
+
+	$provide int lineColorIndex(ProjectInterface::getColorIndex("red"));
+	$provide int xColorIndex(ProjectInterface::getColorIndex("red"));
+	$provide int oColorIndex(ProjectInterface::getColorIndex("red"));
+
+	struct Location {
+		double x, y;
+		Location(double nx = 0.0, double ny = 0.0) : x(nx), y(ny) {}
+		Location(Point p) : x(p.coordX()), y(p.coordY()) {}
+		double dist(const Location other) const {
+			return fabs(x - other.x) + fabs(y - other.y);
+		}
+		bool close(const Location other) const {
+			// use manhattan distance metric
+			return dist(other) < CLOSE_DISTANCE_TOLERANCE;
+		}
+		string toString() const {
+			stringstream sx;
+			sx << x;
+			stringstream sy;
+			sy <<  y;
+			return "(" + sx.str() + ", " + sy.str() + ")";
+		}
+	};
+
+	struct PieceInfo {
+		Location loc;
+		BoardPiece pieceType;
+		ShapeRoot shape;
+		std::pair<int, int> boardLoc;
+		PieceInfo(Location sloc = Location(), BoardPiece spieceType = None, ShapeRoot sshape = ShapeRoot(), std::pair<int, int> sboardLocs = make_pair(-1, -1)) : loc(sloc), pieceType(spieceType), shape(sshape), boardLoc(sboardLocs) {}
+	};
+	struct BoardInfo {
+		std::vector<std::vector<Location> > boardLocs; // places to put pieces on, boardLocs[x][y] = location for board[x][y]
+		std::vector<Location> freeLocs; // places to put free pieces on
+		BoardInfo(std::vector<std::vector<Location> > sboardLocs = std::vector<std::vector<Location> >(), std::vector<Location> sfreeLocs = std::vector<Location>()) : boardLocs(sboardLocs), freeLocs(sfreeLocs) {}
+	};
+
+  $nodeclass FindBoardLines : MapBuilderNode(MapBuilderRequest::cameraMap) : doStart {
+		$reference TicTacToe_HR::lineColor;
+		$reference TicTacToe_HR::xColor, TicTacToe_HR::oColor;
+		mapreq.addObjectColor(lineDataType, lineColor);
+		mapreq.addObjectColor(crossDataType, xColor);
+		mapreq.addObjectColor(naughtDataType, oColor);
+		mapreq.addAllMinBlobAreas(300);
+		mapreq.maxDist = 2500;   //Ignore objects farther than this distance.
+
+		//mapreq.searchArea = TicTacToe_HR::getGazePoints();
+		mapreq.pursueShapes = false;
+		mapreq.setVerbosity = -1u; // Turn on all mapbuilder warnings
+	}
+
+	struct BoardAction {
+		Location end;
+		ShapeRoot shape;
+		int _index;
+		BoardAction() : end(Location()), shape(), _index(-1) {}
+		BoardAction(Location lend, ShapeRoot sshape, int iindex) : end(lend), shape(sshape), _index(iindex) {}
+		void _print() const {
+			std::cout << "Action: Move " << shape << " to " << end.toString() << std::endl;;
+		}
+	};
+
+	struct SearchStateInfo;
+
+  struct BoardState {
+		Location robot;
+		std::vector<PieceInfo> pieces;
+
+		BoardState(Location robotLoc = Location(), std::vector<PieceInfo> piecesLoc = std::vector<PieceInfo>()) : robot(robotLoc), pieces(piecesLoc) {}
+
+		void _print() {
+			std::cout << "Robot is now at location " << robot.toString() << std::endl;
+			for(size_t i = 0;i < pieces.size();i++) {
+				std::cout << "The piece that is a ";
+				switch(pieces[i].pieceType) {
+					case XPiece:
+						std::cout << "X";
+						break;
+					case OPiece:
+						std::cout << "O";
+						break;
+					case None:
+						std::cout << "None";
+						break;
+				}
+				std::cout << " is at location " << pieces[i].loc.toString();
+				if( pieces[i].boardLoc != make_pair(-1, -1) ) {
+					std::cout << " which is (" << pieces[i].boardLoc.first << ", " << pieces[i].boardLoc.second << ") on the board" << std::endl;
+				} else {
+					std::cout << " which is not on the board" << std::endl;
+				}
+			}
+		}
+
+		double calculateCost(const BoardAction action) const {
+			return 0;
+		}
+
+		BoardState makeNextState(const BoardAction action, const BoardInfo info) const {
+			std::vector<PieceInfo> newpieces = std::vector<PieceInfo>(pieces);
+			PieceInfo movedPiece = newpieces[action._index];
+			movedPiece.loc = action.end;
+			bool onBoard = false;
+			for(size_t i = 0;i < 3;i++) {
+				for(size_t j = 0;j < 3;j++) {
+					if( info.boardLocs[i][j].close(movedPiece.loc) ) {
+						movedPiece.boardLoc = make_pair(i, j);
+						onBoard = true;
+						break;
+					}
+				}
+				if( onBoard ) break;
+			}
+			if( !onBoard ) {
+				movedPiece.boardLoc = make_pair(-1, -1);
+			}
+			newpieces.erase(newpieces.begin() + action._index);
+			newpieces.push_back(movedPiece);
+
+			return BoardState(action.end, newpieces);
+		}
+	};
+
+	struct SearchStateInfo {
+		BoardState state;
+		double cost;
+		std::vector<BoardAction> actions;
+		SearchStateInfo(BoardState sstate = BoardState(),
+						double scost = 0.0,
+						std::vector<BoardAction> sactions = std::vector<BoardAction>()) : state(sstate), cost(scost), actions(sactions) {}
+		void _print() {
+			std::cout << "State is:" << std::endl;
+			state._print();
+			std::cout << "Actions are:" << std::endl;
+			for(size_t i = 0; i < actions.size();i++) {
+				actions[i]._print();
+			}
+		}
+	};
+
+	$nodeclass ParseBoard : VisualRoutinesStateNode {
+
+		virtual void doStart() {
+			std::cout << "Parsing board." << std::endl;
+
+			if ( parseImage() )
+				postStateSuccess();
+			else
+				postStateFailure();
+
+			std::cout << "Board parsing complete" << std::endl;
+		}
+
+		bool parseImage() {
+			NEW_SHAPEVEC(lines, LineData, parseLines());
+			if ( lines.size() < 4 )
+				return false;
+			return true;
+		}
+
+
+    bool isNorthOf(Shape<LineData> ln1, Shape<LineData> ln2) {
+      return ln1->isAbove(ln2);
+    }
+    bool isWestOf(Shape<LineData> ln1, Shape<LineData> ln2) {
+      return ln1->isLeftOf(ln2);
+    }
+
+    /*! 1. sort lines by length
+     *  2. select longest horizontal line and next longest line parallel to it
+     *  3. select two longest lines not parallel to either line from previous step */
+    class IsLong : public UnaryShapePred<LineData> {
+    public:
+      IsLong() {};
+      bool operator() (Shape<LineData> l) const {
+        return l->getLength() > 2000.0f;
+      };
+    };
+
+// ****************************************************************************************
+    vector<Shape<LineData> > parseLines() {
+      $reference TicTacToe_HR::boardlines;
+      $reference TicTacToe_HR::gridLen;
+      NEW_SHAPEVEC(boardLines, LineData, vector<Shape<LineData> >());
+
+      // 1. sort by length
+      // delete lines that are too long.
+//      NEW_SHAPEVEC(longLines, LineData, subset(allLines, IsLong()));
+//      SHAPEVEC_ITERATE(longLines, LineData, l) {
+//        l.deleteShape();
+//      } END_ITERATE;
+
+      // long lines are now deleted from worldShS
+      // select_type: Select the Shape<T> elements from a vector of ShapeRoots
+      // DualCoding/ShapeFuns
+      NEW_SHAPEVEC(lines, LineData, select_type<LineData>(camShS));
+
+      lines = stable_sort(lines,not2(LineData::LengthLessThan()));
+
+      if ( lines.size() < 4 ) {
+        cout << "Found " << lines.size() << " lines in the image; needed 4." << endl;
+        return boardLines;
+      }
+
+     // 2. Find the north and south horizontal lines
+      NEW_SHAPE(leftLine, LineData, Shape<LineData>());
+      NEW_SHAPE(rightLine, LineData, Shape<LineData>());
+
+//      SHAPEVEC_ITERATE(lines, LineData, ln1) {
+//        cout << " ===========================!!! CHECK" << endl;
+//        cout << "ln1: " << ln1->end1Pt().coordX() << " , " << ln1->end1Pt().coordY() << endl;
+//        cout << "ln1: " << ln1->end2Pt().coordX() << " , " << ln1->end2Pt().coordY() << endl;
+//      } END_ITERATE
+
+      SHAPEVEC_ITERATE(lines, LineData, ln1) {
+        if ( LineData::IsVertical()(ln1) ) {
+          SHAPENEXT_ITERATE(lines, LineData, ln1, ln2) {
+            if ( LineData::ParallelTest()(ln1,ln2) ) {
+              leftLine = ln1->isLeftOf(ln2) ? ln1 : ln2;
+              rightLine = ln1->isLeftOf(ln2) ? ln2 : ln1;
+              break;
+            }
+            END_ITERATE }
+        }
+        if ( leftLine )
+          break;
+        END_ITERATE }
+      if ( ! leftLine ) {
+        cout << "Couldn't find left or right line" << endl;
+        return boardLines;
+      }
+
+      // 3. Find the left and right sort-of-vertical lines
+      NEW_SHAPE(topLine, LineData, Shape<LineData>());
+      NEW_SHAPE(bottomLine, LineData, Shape<LineData>());
+      SHAPEVEC_ITERATE(lines, LineData, ln1) {
+        if ( !LineData::ParallelTest()(leftLine,ln1) ) {
+          SHAPENEXT_ITERATE(lines, LineData, ln1, ln2) {
+            if ( !LineData::ParallelTest()(rightLine,ln2) ) {
+              topLine = ln1->isAbove(ln2) ? ln1 : ln2;
+              bottomLine = ln1->isAbove(ln2) ? ln2 : ln1;
+              break;
+            }
+            END_ITERATE }
+        }
+        if ( topLine )
+          break;
+        END_ITERATE }
+      if ( ! topLine ) {
+        cout << "Couldn't find left or right line" << endl;
+        return boardLines;
+      }
+
+      cout << "Top line: " << topLine->end1Pt().coordX() << " , " << topLine->end1Pt().coordY() << endl;
+      cout << "Top line: " << topLine->end2Pt().coordX() << " , " << topLine->end2Pt().coordY() << endl;
+
+      cout << "bottom line: " << bottomLine->end1Pt().coordX() << " , " << bottomLine->end1Pt().coordY() << endl;
+      cout << "bottom line: " << bottomLine->end2Pt().coordX() << " , " << bottomLine->end2Pt().coordY() << endl;
+      cout << "left line: " << leftLine->end1Pt().coordX() << " , " << leftLine->end1Pt().coordY() << endl;
+      cout << "left line: " << leftLine->end2Pt().coordX() << " , " << leftLine->end2Pt().coordY() << endl;
+      cout << "right line: " << rightLine->end1Pt().coordX() << " , " << rightLine->end1Pt().coordY() << endl;
+      cout << "right line: " << rightLine->end2Pt().coordX() << " , " << rightLine->end2Pt().coordY() << endl;
+
+      // rename and return lines in specified order
+      topLine->setName("topLine");
+      bottomLine->setName("bottomLine");
+      leftLine->setName("leftLine");
+      rightLine->setName("rightLine");
+
+      boardLines.push_back(topLine);
+      boardLines.push_back(bottomLine);
+      boardLines.push_back(leftLine);
+      boardLines.push_back(rightLine);
+
+      parseBoundaries(topLine, bottomLine, leftLine, rightLine);
+
+      SHAPEVEC_ITERATE(lines, LineData, line) {
+	  	bool useless = false;
+	  	for(int i = 0;i < 4;i++) {
+			  if( boardLines[i] != line ) {
+	  		  line.deleteShape();
+		   		useless = true;
+			  	break;
+			  }
+		  }
+
+		  if( !useless ) {
+			  line->setLandmark(true);
+			  line->setObstacle(false);
+		  }
+      } END_ITERATE;
+
+      //gridLen = 80.0;
+			gridLen = (topLine->getLength()+bottomLine->getLength()+leftLine->getLength()+rightLine->getLength())/12;
+			gridLen = gridLen * 0.75;
+
+      for(size_t i = 0; i < boardLines.size(); i++) {
+        boardlines.push_back(boardLines[i]);
+      }
+      return boardLines;
+    }
+
+	inline Point extendOut(const Point &from, const Point &to) {
+		Point ext = to - from;
+		ext.setCoords(ext.coordX(), ext.coordY());
+		ext *= 2;
+		return from + ext;
+	}
+
+	inline Point extendRobotOut(const Point &from, const Point &to) {
+		Point ext = to - from;
+		ext.setCoords(ext.coordX(), ext.coordY());
+		ext *= 3;
+		return from + ext;
+	}
+
+	inline std::vector<Point> splitSegments(const Point &a, const Point &b, int n = 5) {
+		Point diff = b - a;
+		diff.setCoords(diff.coordX(), diff.coordY());
+		diff /= n;
+		Point half = diff;
+		half /= 2;
+		Point cur = a;
+		std::vector<Point> ans;
+		for(int i = 0;i < n;i++) {
+			ans.push_back(cur + half);
+			cur += diff;
+		}
+		return ans;
+	}
+
+    void parseBoundaries(const Shape<LineData>& topLine, const Shape<LineData>& bottomLine,
+                         const Shape<LineData>& leftLine, const Shape<LineData>& rightLine) {
+      $reference TicTacToe_HR::squares;
+	  	$reference TicTacToe_HR::boardInfo;
+
+      const Point& tl = topLine->leftPt();
+      const Point& tr = topLine->rightPt();
+      const Point& bl = bottomLine->leftPt();
+      const Point& br = bottomLine->rightPt();
+      const Point& lt = leftLine->topPt();
+      const Point& lb = leftLine->bottomPt();
+      const Point& rt = rightLine->topPt();
+      const Point& rb = rightLine->bottomPt();
+
+//      cout << "Top line: " << topLine->end1Pt().coordX() << " , " << topLine->end1Pt().coordY() << endl;
+//      cout << "Top line: " << topLine->end2Pt().coordX() << " , " << topLine->end2Pt().coordY() << endl;
+
+//      cout << "bottom line: " << bottomLine->end1Pt().coordX() << " , " << bottomLine->end1Pt().coordY() << endl;
+//      cout << "bottom line: " << bottomLine->end2Pt().coordX() << " , " << bottomLine->end2Pt().coordY() << endl;
+//      cout << "left line: " << leftLine->end1Pt().coordX() << " , " << leftLine->end1Pt().coordY() << endl;
+//      cout << "left line: " << leftLine->end2Pt().coordX() << " , " << leftLine->end2Pt().coordY() << endl;
+//      cout << "right line: " << rightLine->end1Pt().coordX() << " , " << rightLine->end1Pt().coordY() << endl;
+//      cout << "right line: " << rightLine->end2Pt().coordX() << " , " << rightLine->end2Pt().coordY() << endl;
+
+
+
+      Point top = lt.isRightOf(rt) ? lt : rt;
+      Point left = tl.isBelow(bl) ? tl : bl;
+      Point right = tr.isAbove(br) ? tr : br;
+      Point bottom = lb.isLeftOf(rb) ? lb : rb;
+
+      NEW_SHAPE(topBoundary, LineData, new LineData(camShS, top, topLine->getOrientation()));
+      NEW_SHAPE(leftBoundary, LineData, new LineData(camShS, left, leftLine->getOrientation()));
+      NEW_SHAPE(rightBoundary, LineData, new LineData(camShS, right, rightLine->getOrientation()));
+      NEW_SHAPE(bottomBoundary, LineData, new LineData(camShS, bottom, bottomLine->getOrientation()));
+
+      // outer corners
+      Point otlc = leftBoundary->intersectionWithLine(topBoundary);
+      cout << "otlc: " << otlc.coordX() << " , " << otlc.coordY() << endl;
+      Point otrc = topBoundary->intersectionWithLine(rightBoundary);
+      Point oblc = bottomBoundary->intersectionWithLine(leftBoundary);
+      Point obrc = rightBoundary->intersectionWithLine(bottomBoundary);
+
+      // center square points
+      Point itlc = topLine->intersectionWithLine(leftLine);
+      Point itrc = topLine->intersectionWithLine(rightLine);
+      Point iblc = bottomLine->intersectionWithLine(leftLine);
+      Point ibrc = bottomLine->intersectionWithLine(rightLine);
+
+      // edge points not on the corners of the board
+      Point etlc = topLine->intersectionWithLine(leftBoundary);
+      Point eblc = bottomLine->intersectionWithLine(leftBoundary);
+      Point etrc = topLine->intersectionWithLine(rightBoundary);
+      Point ebrc = bottomLine->intersectionWithLine(rightBoundary);
+
+      Point eltc = leftLine->intersectionWithLine(topBoundary);
+      Point elbc = leftLine->intersectionWithLine(bottomBoundary);
+      Point ertc = rightLine->intersectionWithLine(topBoundary);
+      Point erbc = rightLine->intersectionWithLine(bottomBoundary);
+
+      squares.push_back(makeSquare(otlc, eltc, itlc, etlc));
+      squares.push_back(makeSquare(eltc, ertc, itrc, itlc));
+      squares.push_back(makeSquare(ertc, otrc, etrc, itrc));
+      squares.push_back(makeSquare(etlc, itlc, iblc, eblc));
+      squares.push_back(makeSquare(itlc, itrc, ibrc, iblc));
+      squares.push_back(makeSquare(itrc, etrc, ebrc, ibrc));
+      squares.push_back(makeSquare(eblc, iblc, elbc, oblc));
+      squares.push_back(makeSquare(iblc, ibrc, erbc, elbc));
+      squares.push_back(makeSquare(ibrc, ebrc, obrc, erbc));
+
+	  boardInfo.boardLocs.clear();
+
+	  std::vector<Location> locs;
+	  for(size_t i = 0;i < squares.size();i++) {
+	  	Point center = squares[i]->getCentroid();
+	  	//cout << " Parsing board : " << float(center.coordX()) << " and " << float(center.coordY) << endl;
+		locs.push_back(Location(center.coordX(), center.coordY()));
+		  if( locs.size() == 3 ) {
+			  boardInfo.boardLocs.push_back(locs);
+			  locs.clear();
+		  }
+	  }
+
+	  Point outPoint1 = extendOut(squares[4]->getCentroid(), squares[5]->getCentroid());
+	  Point outPoint2 = extendOut(squares[5]->getCentroid(), outPoint1);
+
+	  NEW_SHAPE(outLine1, LineData, new LineData(camShS, outPoint1, rightLine->getOrientation()));
+	  NEW_SHAPE(outLine2, LineData, new LineData(camShS, outPoint2, rightLine->getOrientation()));
+
+	  boardInfo.freeLocs.clear();
+	  std::vector<Point> spaces1 = splitSegments(outLine1->intersectionWithLine(topBoundary), outLine1->intersectionWithLine(bottomBoundary));
+	  std::vector<Point> spaces2 = splitSegments(outLine2->intersectionWithLine(topBoundary), outLine2->intersectionWithLine(bottomBoundary));
+//	  for(size_t i = 0;i < spaces1.size();i++) {
+//	  	boardInfo.freeLocs.push_back(Location(spaces1[i].coordX(), spaces1[i].coordY()));
+//	  }
+//	  for(size_t i = 0;i < spaces2.size();i++) {
+//	  	boardInfo.freeLocs.push_back(Location(spaces2[i].coordX(), spaces2[i].coordY()));
+//	  }
+
+    topBoundary.deleteShape();
+    leftBoundary.deleteShape();
+    rightBoundary.deleteShape();
+    bottomBoundary.deleteShape();
+	  outLine1.deleteShape();
+	  outLine2.deleteShape();
+
+    }
+
+    Shape<PolygonData> makeSquare(Point tlc, Point trc, Point brc, Point blc) {
+      vector<Point> points;
+      points.push_back(tlc);
+      points.push_back(trc);
+      points.push_back(brc);
+      points.push_back(blc);
+
+      NEW_SHAPE(square, PolygonData, new PolygonData(camShS, points, true));
+      square->setObstacle(false);
+      return square;
+    }
+  }  //parseboard
+
+  $nodeclass ReadPlayerPiece : doStart {
+		$reference TicTacToe_HR::currentTurn;
+		$reference TicTacToe_HR::playerPiece;
+		//VRmixin::drawShapes.clear();
+		// set player piece
+		const TextMsgEvent *txtev = dynamic_cast<const TextMsgEvent*>(event);
+		string choosePieceInput = txtev->getText();
+		if( choosePieceInput == string("X") ) {
+			currentTurn = RobotTurn;
+			playerPiece = XPiece;
+			postStateSuccess();
+		} else if ( choosePieceInput == string("O") ) {
+			currentTurn = PlayerTurn;
+			playerPiece = OPiece;
+			postStateSuccess();
+		} else {
+			std::cout << "Invalid input, try again." << std::endl;
+			std::cout << "Enter what piece the player plays (msg [X, O]):" << std::endl;
+			postStateFailure();
+		}
+	}
+
+	$nodeclass FirstMove : doStart {
+		$reference TicTacToe_HR::currentTurn;
+		postStateSignal<Turn>(currentTurn);
+	}
+
+	// AI code
+	static std::pair<PlayerMoveChange, std::pair<int, int> >
+	       diffBoard(const std::vector<std::vector<BoardPiece> >& b,
+		             const std::vector<std::vector<BoardPiece> >& newb) {
+
+		int validDiff = 0;
+		std::pair<int, int> res;
+		for(int i = 0;i < 3;i++) {
+			for(int j = 0;j < 3;j++) {
+				if( b[i][j] == None && b[i][j] != newb[i][j] ) {
+					res = make_pair(i, j);
+					validDiff++;
+				} else if ( b[i][j] != newb[i][j] ) {
+					return make_pair(InvalidMove, res);
+				}
+			}
+		}
+		if( validDiff == 0 ) {
+			return make_pair(NoMove, res);
+		}
+		if( validDiff == 1 ) {
+			return make_pair(ValidMove, res);
+		}
+		return make_pair(InvalidMove, res);
+	}
+
+	static void printBoard(const std::vector<std::vector<BoardPiece> >& b) {
+		std::cout << "=======" << std::endl;
+		for(int i = 0;i < 3;i++) {
+			std::cout << "|";
+			for(int j = 0;j < 3;j++) {
+				switch(b[i][j]) {
+					case None:
+						std::cout << " ";
+						break;
+					case OPiece:
+						std::cout << "O";
+						break;
+					case XPiece:
+						std::cout << "X";
+				}
+				std::cout << "|";
+			}
+			std::cout << "\n=======" << std::endl;
+		}
+	}
+
+	static int fullBoard(const std::vector<std::vector<BoardPiece> >& b) {
+		for(int i = 0;i < 3;i++) {
+			for(int j = 0;j < 3;j++) {
+				if( b[i][j] == None ) { return false; }
+			}
+		}
+		return true;
+	}
+
+	static BoardPiece winner(const std::vector<std::vector<BoardPiece> >& b) {
+		for(int p = OPiece; p <= XPiece;p++) {
+			for(int i = 0;i < 3;i++) {
+				bool isP = true;
+				for(int j = 0;j < 3;j++) {
+					if( b[i][j] != p ) {
+						isP = false;
+						break;
+					}
+				}
+				if( isP ) { return static_cast<BoardPiece>(p); }
+			}
+
+			for(int i = 0;i < 3;i++) {
+				bool isP = true;
+				for(int j = 0;j < 3;j++) {
+					if( b[j][i] != p ) {
+						isP = false;
+						break;
+					}
+				}
+				if( isP ) { return static_cast<BoardPiece>(p); }
+			}
+			bool isP = true;
+			for(int i = 0;i < 3;i++) {
+				if( b[i][i] != p ) {
+					isP = false;
+					break;
+				}
+			}
+			if( isP ) { return static_cast<BoardPiece>(p); }
+			isP = true;
+			for(int i = 0;i < 3;i++) {
+				if( b[i][2 - i] != p ) {
+					isP = false;
+					break;
+				}
+			}
+			if( isP ) { return static_cast<BoardPiece>(p); }
+		}
+		return None;
+	}
+
+	static int optimalMove
+	(const std::vector<std::vector<BoardPiece> >& b, const BoardPiece aiPiece, int &wini, int &winj) {
+		BoardPiece win = winner(b);
+		if( win == aiPiece ) { return 1; }
+		if( win != None ) { return -1; }
+
+		int bestMoveVal = -2;
+		for(int i = 0;i < 3;i++) {
+			for(int j = 0;j < 3;j++) {
+				if( b[i][j] == None ) {
+					std::vector<std::vector<BoardPiece> > newb =
+					  std::vector<std::vector<BoardPiece> >(b);
+					newb[i][j] = aiPiece;
+					int x, y;
+					int res = -optimalMove(newb, static_cast<BoardPiece>(3 - aiPiece), x, y);
+					if( res > bestMoveVal ) {
+						bestMoveVal = res;
+						wini = i;
+						winj = j;
+					}
+				}
+			}
+		}
+		return (bestMoveVal == -2 ? 0 : bestMoveVal);
+	}
+
+	static int aiMove
+	(const std::vector<std::vector<BoardPiece> >& b, const BoardPiece aiPiece, int &wini, int &winj) {
+		int moveVal = optimalMove(b, aiPiece, wini, winj);
+		if( (rand() % 101) <= AI_DIFFICULTY ) {
+			return moveVal;
+		} else {
+			std::vector<std::pair<int, int> > positions;
+			for(int i = 0;i < 3;i++) {
+				for(int j = 0;j < 3;j++) {
+					if( !(i == wini && j == winj) && b[i][j] == None ) {
+						positions.push_back(make_pair(i, j));
+					}
+				}
+			}
+			if( positions.size() == 0 ) {
+				return moveVal;
+			}
+			std::pair<int, int> randMove = positions[rand() % positions.size()];
+			wini = randMove.first;
+			winj = randMove.second;
+			std::vector<std::vector<BoardPiece> > testBoard = b;
+			testBoard[wini][winj] = aiPiece;
+			int tempi, tempj;
+			int opponentVal = optimalMove(testBoard, static_cast<BoardPiece>(3 - aiPiece), tempi, tempj);
+			return 1 - opponentVal;
+		}
+	}
+
+	static double evalWinPercent(const std::vector<std::vector<BoardPiece> >& b, const BoardPiece evalPiece) {
+		// break early if it takes too long
+		const int veryShortTrials = 1;
+		const int shortTrials = 8;
+		const int longTrials = 18;
+
+		size_t empty_spaces = 0;
+		for(int i = 0;i < 3;i++) {
+			for(int j = 0;j < 3;j++) {
+				if( b[i][j] == None ) {
+					empty_spaces++;
+				}
+			}
+		}
+
+		int trials;
+		if( empty_spaces >= 8 ) {
+			trials = veryShortTrials;
+		} else if ( empty_spaces >= 5 ) {
+			trials = shortTrials;
+		} else {
+			trials = longTrials;
+		}
+
+		double winSum = 0;
+		int tempi, tempj;
+		for(int i = 0;i < trials;i++) {
+			winSum += aiMove(b, evalPiece, tempi, tempj);
+		}
+		winSum += (longTrials - trials) * ((AI_DIFFICULTY / 100.0) * 2 - 1);
+		return (winSum / longTrials + 1) / 2;
+	}
+
+	$nodeclass SimulatePlayerMove : doStart {
+		$reference TicTacToe_HR::last_i;
+		$reference TicTacToe_HR::last_j;
+		$reference TicTacToe_HR::playerPiece;
+		$reference TicTacToe_HR::board;
+		$reference TicTacToe_HR::boardState;
+		$reference TicTacToe_HR::boardInfo;
+
+		std::cout << "Entering player move simulation" << std::endl;
+		TicTacToe_HR::aiMove(board, playerPiece, last_i, last_j);
+		std::vector<std::vector<BoardPiece> > newb = board;
+		newb[last_i][last_j] = playerPiece;
+		printBoard(newb);
+		std::vector<PieceInfo> afterPieces = std::vector<PieceInfo>(boardState.pieces);
+		afterPieces.push_back(PieceInfo(boardInfo.boardLocs[last_i][last_j], playerPiece, ShapeRoot(), make_pair(last_i, last_j)));
+		postStateCompletion();
+	}
+
+	$nodeclass DrawPiece : VisualRoutinesStateNode : doStart {
+		$reference TicTacToe_HR::currentTurn;
+		$reference TicTacToe_HR::boardInfo;
+		$reference TicTacToe_HR::boardState;
+		$reference TicTacToe_HR::last_i;
+		$reference TicTacToe_HR::last_j;
+		$reference TicTacToe_HR::board;
+
+		std::pair<int, int> loc = make_pair(last_i, last_j);
+
+		double x = boardInfo.boardLocs[last_i][last_j].x;
+		double y = boardInfo.boardLocs[last_i][last_j].y;
+		if(currentTurn == PlayerTurn) {
+			NEW_SHAPE(destination1, LineData, new LineData(camShS, Point(x - 25, y), Point(x + 25, y)));
+			NEW_SHAPE(destination2, LineData, new LineData(camShS, Point(x, y - 25), Point(x, y + 25)));
+			boardState.pieces.push_back(PieceInfo(boardInfo.boardLocs[last_i][last_j], XPiece, ShapeRoot(), loc));
+			destination1->setColor("red");
+			destination2->setColor("red");
+			VRmixin::drawShapes.push_back(destination1);
+			VRmixin::drawShapes.push_back(destination2);
+		} else {
+			NEW_SHAPE(destination, EllipseData, new EllipseData(camShS, Point(x, y), 22, 22));
+			destination->setColor("blue");
+			VRmixin::drawShapes.push_back(destination);
+			boardState.pieces.push_back(PieceInfo(boardInfo.boardLocs[last_i][last_j], OPiece, ShapeRoot(), loc));
+		}
+
+    if( TicTacToe_HR::winner(board) != None ) {
+			postStateFailure();
+			return;
+		}
+		postStateSuccess();
+  }
+
+	$nodeclass NewGame : doStart {
+	  $reference TicTacToe_HR::counter_1;
+	  $reference TicTacToe_HR::counter_2;
+	  $reference TicTacToe_HR::playerPiece;
+	  $reference TicTacToe_HR::currentTurn;
+
+	  playerPiece = XPiece;
+	  currentTurn = RobotTurn;
+	  VRmixin::drawShapes.clear();
+
+	  counter_1 = 0;
+	  counter_2 = 0;
+		std::cout << "New game started!" << std::endl;
+	}
+
+	$nodeclass Reinit : doStart {
+		$reference TicTacToe_HR::boardState;
+		$reference TicTacToe_HR::boardInfo;
+		$reference TicTacToe_HR::boardlines;
+		$reference TicTacToe_HR::squares;
+
+    cout << "Reinit............................." << endl;
+		boardState.pieces.clear();
+		boardInfo.boardLocs.clear();
+		boardlines.clear();
+    squares.clear();
+
+		postStateCompletion();
+	}
+
+	$nodeclass WaitTurn : doStart {
+		std::cout << "Waiting for player to make a move!" << std::endl;
+	}
+
+	$nodeclass ReadBoardChange : doStart {
+		$reference TicTacToe_HR::board;
+		$reference TicTacToe_HR::boardState;
+		$reference TicTacToe_HR::last_player_i;
+		$reference TicTacToe_HR::last_player_j;
+		/* $reference TicTacToe_HR::boardInfo; */
+		$reference TicTacToe_HR::currentTurn;
+
+		PlayerMoveChange playerMoveChange;
+		std::vector<std::vector<BoardPiece> > newb = std::vector<std::vector<BoardPiece> >(3, std::vector<BoardPiece>(3));
+		for(size_t i = 0;i < boardState.pieces.size();i++) {
+			int x = boardState.pieces[i].boardLoc.first;
+			int y = boardState.pieces[i].boardLoc.second;
+			if( x != -1 && y != -1 ) {
+				newb[x][y] = boardState.pieces[i].pieceType;
+			}
+		}
+
+		std::pair<PlayerMoveChange, std::pair<int, int> > diff = diffBoard(board, newb);
+		playerMoveChange = diff.first;
+
+    if( currentTurn == PlayerTurn) {
+		  last_player_i = diff.second.first;
+		  last_player_j = diff.second.second;
+	  }
+
+		if( playerMoveChange == ValidMove && currentTurn!=RobotTurn) {
+				board = newb;
+				printBoard(board);
+		}
+		postStateSignal<PlayerMoveChange>(playerMoveChange);
+	}
+
+	$nodeclass RestoreBoard : doStart {
+		$reference TicTacToe_HR::board;
+		$reference TicTacToe_HR::boardInfo;
+
+		std::cout << "Restoring board to " << std::endl;
+		printBoard(board);
+		std::vector<PieceInfo> pieces;
+		for(int i = 0;i < 3;i++) {
+			for(int j = 0;j < 3;j++) {
+				if( board[i][j] != None ) {
+					pieces.push_back(PieceInfo(boardInfo.boardLocs[i][j], board[i][j], ShapeRoot(), make_pair(i, j)));
+				}
+			}
+		}
+	}
+
+	$nodeclass ClearBoardPlan : StateNode : doStart {
+		$reference TicTacToe_HR::board;
+		$reference TicTacToe_HR::boardlines;
+		$reference TicTacToe_HR::boardInfo;
+
+		board = std::vector<std::vector<BoardPiece> >(3, std::vector<BoardPiece>(3));
+
+    bool pieceOnBoard = false;
+		NEW_SHAPEVEC(x_pieces, CrossData, select_type<CrossData>(camShS));
+		NEW_SHAPEVEC(o_pieces, NaughtData, select_type<NaughtData>(camShS));
+
+    std::vector<Shape<CrossData> >::iterator it;
+    for( it = x_pieces.begin(); it != x_pieces.end(); ) {
+      for(size_t j = 0; j < boardlines.size(); j++) {
+          if(boardlines[j]->perpendicularDistanceFrom((*it)->getLine1().getCentroid()) < 5 || boardlines[j]->perpendicularDistanceFrom((*it)->getLine2().getCentroid()) < 5) {
+            (*it).deleteShape();
+            it = x_pieces.erase(it);
+            break;
+          }
+          if( j == boardlines.size() - 1)
+            it++;
+      }
+   }
+
+    SHAPEVEC_ITERATE(x_pieces, CrossData, piece) {
+      Location loc = Location(piece->getCentroid().coordX(),
+                              piece->getCentroid().coordY());
+      if( boardInfo.boardLocs[1][1].dist(loc) < 480 )
+        pieceOnBoard = true;
+    } END_ITERATE;
+
+
+    SHAPEVEC_ITERATE(o_pieces, NaughtData, piece) {
+      Location loc = Location(piece->getCentroid().coordX(),
+                              piece->getCentroid().coordY());
+      if( boardInfo.boardLocs[1][1].dist(loc) < 480 )
+        pieceOnBoard = true;
+    } END_ITERATE;
+
+    if (! pieceOnBoard)
+      postStateSuccess();
+    else
+		  postStateFailure();
+	}
+
+	$nodeclass EndGamePrompt : doStart {
+		std::cout << "Game ended!" << std::endl;
+	}
+
+	$nodeclass EndGame : doStart {
+		$reference TicTacToe_HR::board;
+		$reference TicTacToe_HR::playerPiece;
+		BoardPiece pc = TicTacToe_HR::winner(board);
+		cout << "　End game................. winner is : " << pc << endl;
+		if( pc == None ) {
+			postStateCompletion();
+		} else if( pc != playerPiece ) {
+			postStateSuccess();
+		} else {
+			postStateFailure();
+		}
+	}
+
+	$nodeclass AIChoice : doStart {
+		$reference TicTacToe_HR::board;
+		$reference TicTacToe_HR::last_i;
+		$reference TicTacToe_HR::last_j;
+
+		if( TicTacToe_HR::fullBoard(board) || TicTacToe_HR::winner(board) != None ) {
+			postStateFailure();
+			return;
+		}
+		string pieceName = "O";
+		std::cout << "Robot thinking (plays " << pieceName << ")" << std::endl;
+		TicTacToe_HR::aiMove(board, OPiece, last_i, last_j);
+		cout << "Move! (" << last_i << " , " << last_j << " )"<< endl;
+		std::cout.precision(1);
+		std::cout << "Robot's estimated percentage of winning: " << std::fixed << 100 * evalWinPercent(board, OPiece) << "%" << std::endl;
+		board[last_i][last_j] = OPiece;
+		printBoard(board);
+		std::cout << "Robot decided" << std::endl;
+		if( TicTacToe_HR::fullBoard(board) ) {
+			postStateFailure();
+			return;
+		}
+		postStateSuccess();
+	}
+
+  $nodeclass ExaminePieces : doStart {
+
+    $reference TicTacToe_HR::board;
+    $reference TicTacToe_HR::boardInfo;
+    $reference TicTacToe_HR::playerPiece;
+    $reference TicTacToe_HR::boardlines;
+    $reference TicTacToe_HR::newPiece;
+    $reference TicTacToe_HR::gridLen;
+
+    int cnt = 0;
+
+    if( playerPiece == OPiece ) {
+      NEW_SHAPEVEC(pieces, NaughtData, select_type<NaughtData>(camShS));
+      int const num = pieces.size();
+      if ( num == 0 ) {
+        postStateFailure();
+        return;
+      }
+      else {
+        for(int i = 0; i < 3; i++)
+          for(int j = 0; j < 3; j++)
+            for(size_t k = 0; k < pieces.size(); k++) {
+              if (boardInfo.boardLocs[i][j].dist(Location(pieces[k]->getCentroid().coordX(), pieces[k]->getCentroid().coordY())) < gridLen && board[i][j] !=OPiece) {
+              newPiece = Location(pieces[k]->getCentroid().coordX(), pieces[k]->getCentroid().coordY());
+              cnt++;
+              }
+            }
+      if(cnt > 1) {
+        postStateFailure();
+        return;
+      }
+      postStateSuccess();
+      }
+    } else {
+      NEW_SHAPEVEC(pieces, CrossData, select_type<CrossData>(camShS));
+      std::vector<Shape<CrossData> >::iterator it;
+      for( it = pieces.begin(); it != pieces.end(); ) {
+        for(size_t j = 0; j < boardlines.size(); j++) {
+         if(boardlines[j]->perpendicularDistanceFrom((*it)->getLine1().getCentroid()) < 5 || boardlines[j]->perpendicularDistanceFrom((*it)->getLine2().getCentroid()) < 5) {
+            (*it).deleteShape();
+            it = pieces.erase(it);
+            break;
+          }
+          if( j == boardlines.size() - 1)
+            it++;
+        }
+      }
+
+      int const num = pieces.size();
+      if ( num == 0 ) {
+        cout << "no move here, pls make one" << endl;
+        postStateFailure();
+        return;
+      } else {
+        for(int i = 0; i < 3; i++)
+          for(int j = 0; j < 3; j++)
+            for(size_t k = 0; k < pieces.size(); k++) {
+              if (boardInfo.boardLocs[i][j].dist(Location((pieces[k]->getCentroid()).coordX(), (pieces[k]->getCentroid()).coordY())) < gridLen && board[i][j]!=XPiece) {
+                newPiece = Location(pieces[k]->getCentroid().coordX(), pieces[k]->getCentroid().coordY());
+                cnt++;
+           }
+        }
+        if(cnt != 1) {
+          postStateFailure();
+          return;
+        }
+      postStateSuccess();
+      }
+    }
+  }
+
+  $nodeclass ReExaminePieces : doStart {
+    $reference TicTacToe_HR::board;
+    $reference TicTacToe_HR::boardState;
+    $reference TicTacToe_HR::boardInfo;
+    $reference TicTacToe_HR::playerPiece;
+    $reference TicTacToe_HR::boardlines;
+    $reference TicTacToe_HR::newPiece;
+    $reference TicTacToe_HR::gridLen;
+
+    Location tmp(0,0);
+    int ti, tj, tk;
+    int cnt = 0;
+    if( playerPiece == OPiece ) {
+      NEW_SHAPEVEC(pieces, NaughtData, select_type<NaughtData>(camShS));
+      int const num = pieces.size();
+      if ( num == 0 ) {
+        postStateFailure();
+        return;
+      } else {
+        for(int i = 0; i < 3; i++)
+          for(int j = 0; j < 3; j++)
+            for(size_t k = 0; k < pieces.size(); k++) {
+              if (boardInfo.boardLocs[i][j].dist(Location(pieces[k]->getCentroid().coordX(), pieces[k]->getCentroid().coordY())) < gridLen && board[i][j] != OPiece) {
+                cnt++;
+                tmp = Location(pieces[k]->getCentroid().coordX(), pieces[k]->getCentroid().coordY());
+                ti = i;
+                tj = j;
+                tk = k;
+              }
+            }
+        if(cnt == 1 && newPiece.dist(tmp) < 5) {
+          boardState.pieces.push_back(PieceInfo(boardInfo.boardLocs[ti][tj], playerPiece, ShapeRoot(), make_pair(ti, tj)));
+          NEW_SHAPE(destination, EllipseData, new EllipseData(camShS, Point(pieces[tk]->getCentroid().coordX(), pieces[tk]->getCentroid().coordY()), pieces[tk]->getRadius(), pieces[tk]->getRadius()));
+          destination->setColor("blue");
+          VRmixin::drawShapes.push_back(destination);
+          postStateSuccess();
+        }
+        else
+          postStateFailure();
+      }
+    }
+    else {
+      NEW_SHAPEVEC(pieces, CrossData, select_type<CrossData>(camShS));
+      std::vector<Shape<CrossData> >::iterator it;
+      for( it = pieces.begin(); it != pieces.end(); ) {
+        for(size_t j = 0; j < boardlines.size(); j++) {
+         if(boardlines[j]->perpendicularDistanceFrom((*it)->getLine1().getCentroid()) < 5 || boardlines[j]->perpendicularDistanceFrom((*it)->getLine2().getCentroid()) < 5) {
+            (*it).deleteShape();
+            it = pieces.erase(it);
+            break;
+          }
+          if( j == boardlines.size() - 1)
+            it++;
+        }
+      }
+
+      int const num = pieces.size();
+      if ( num == 0 ) {
+        postStateFailure();
+        return;
+      }
+      else {
+        for(int i = 0; i < 3; i++)
+          for(int j = 0; j < 3; j++)
+            for(size_t k = 0; k < pieces.size(); k++) {
+              if (boardInfo.boardLocs[i][j].dist(Location(pieces[k]->getCentroid().coordX(), pieces[k]->getCentroid().coordY())) < gridLen && board[i][j] != XPiece) {
+                cnt++;
+                tmp = Location(pieces[k]->getCentroid().coordX(), pieces[k]->getCentroid().coordY());
+                ti = i;
+                tj = j;
+                tk = k;
+              }
+            }
+        if(cnt == 1 && newPiece.dist(tmp) < 5) {
+          postStateSuccess();
+          boardState.pieces.push_back(PieceInfo(boardInfo.boardLocs[ti][tj], playerPiece, ShapeRoot(), make_pair(ti, tj)));
+          NEW_SHAPE(destination1, LineData, pieces[tk]->getLine1());
+          NEW_SHAPE(destination2, LineData, pieces[tk]->getLine2());
+          destination1->setColor("blue");
+          destination2->setColor("blue");
+          VRmixin::drawShapes.push_back(destination1);
+          VRmixin::drawShapes.push_back(destination2);
+        }
+        else
+          postStateFailure();
+      }
+    }
+  }
+
+  $nodeclass FindPieces : MapBuilderNode(MapBuilderRequest::cameraMap) : doStart {
+
+    $reference TicTacToe_HR::xColor, TicTacToe_HR::oColor;
+
+    mapreq.addObjectColor(naughtDataType, oColor);
+    mapreq.addObjectColor(crossDataType, xColor);
+    mapreq.addAllMinBlobAreas(300);
+		/* mapreq.searchArea = TicTacToe::getGazePoints(); */
+		mapreq.pursueShapes = false;
+		mapreq.setVerbosity = -1u; // Turn on all mapbuilder warnings
+    }
+
+  $nodeclass PutPiece : doStart {
+
+    $reference TicTacToe_HR::boardInfo;
+    $reference TicTacToe_HR::last_i;
+		$reference TicTacToe_HR::last_j;
+		$reference TicTacToe_HR::board;
+		$reference TicTacToe_HR::gridLen;
+
+		BoardPiece robotPiece = OPiece;
+
+    NEW_SHAPEVEC(pieces, NaughtData, select_type<NaughtData>(camShS));
+    int const num = pieces.size();
+    if ( num == 0 ) {
+      postStateCompletion();
+      return;
+      } else {
+        for(size_t k = 0; k < pieces.size(); k++) {
+          for(int i = 0; i < 3; i++) {
+            for(int j = 0; j < 3; j++) {
+              if (boardInfo.boardLocs[i][j].dist(Location(pieces[k]->getCentroid().coordX(), pieces[k]->getCentroid().coordY())) < gridLen ) {
+                if( i == last_i && j == last_j) {
+                  NEW_SHAPE(destination, EllipseData, new EllipseData(camShS, Point(pieces[k]->getCentroid().coordX(), pieces[k]->getCentroid().coordY()), pieces[k]->getRadius(), pieces[k]->getRadius()));
+                  VRmixin::drawShapes.pop_back();
+                  pieces[k]->setColor("blue");
+                  VRmixin::drawShapes.push_back(destination);
+                  postStateSuccess();
+                  return;
+                }
+                if( (i!=last_i || j!=last_j) && board[i][j] != robotPiece) {
+                  postStateFailure();
+                  return;
+                }
+              }
+            }
+          }
+        }
+      }
+      postStateCompletion();
+  }
+
+  $nodeclass TestSkS : VisualRoutinesStateNode : doStart {
+    $reference TicTacToe_HR::sks;
+
+    NEW_SKETCH(camFrame, uint, sketchFromSeg());
+    valarray<uint> sks1 = *(camFrame.pixels);
+    valarray<uint> diff = abs(sks1 - sks);
+    long int sum = 0;
+    sum = diff.sum();
+    sks = sks1;
+    if( sum <= 1000 )
+      postStateSuccess();
+    else
+      postStateFailure();
+  }
+
+  $nodeclass TestSkSInit : VisualRoutinesStateNode : doStart {
+    $reference TicTacToe_HR::sks;
+
+    NEW_SKETCH(camFrame, uint, sketchFromSeg());
+    sks = *(camFrame.pixels);
+  }
+
+  $nodeclass SaySomething : doStart {
+    $reference TicTacToe_HR::counter_1;
+
+    if( counter_1 == 3 ) {
+      counter_1 = 0;
+      postStateSuccess();
+      return;
+    }
+    else {
+      counter_1++;
+      postStateFailure();
+      return;
+    }
+  }
+
+  $nodeclass InitCounter : doStart {
+    $reference TicTacToe_HR::counter_1;
+
+    counter_1 = 0;
+  }
+
+  $nodeclass ParsePieces : doStart {
+		$reference TicTacToe_HR::boardInfo;
+		$reference TicTacToe_HR::boardState;
+		$reference TicTacToe_HR::boardlines;
+		$reference TicTacToe_HR::gridLen;
+		$reference TicTacToe_HR::currentTurn;
+
+		VRmixin::drawShapes.clear();
+
+  // x pieces
+		NEW_SHAPEVEC(xpieces, CrossData, select_type<CrossData>(camShS));
+
+    std::vector<Shape<CrossData> >::iterator it;
+    for( it = xpieces.begin(); it != xpieces.end(); ) {
+      for(size_t j = 0; j < boardlines.size(); j++) {
+        if(boardlines[j]->perpendicularDistanceFrom((*it)->getLine1().getCentroid()) < 5 || boardlines[j]->perpendicularDistanceFrom((*it)->getLine2().getCentroid()) < 5) {
+          (*it).deleteShape();
+          it = xpieces.erase(it);
+          break;
+        }
+        if( j == boardlines.size() - 1)
+          it++;
+      }
+    }
+
+  // o pieces
+    NEW_SHAPEVEC(opieces, NaughtData, select_type<NaughtData>(camShS));
+
+  // check if piece in intersection with line
+  // find x pieces on board
+		std::vector<PieceInfo> pieces;
+		SHAPEVEC_ITERATE(xpieces, CrossData, piece) {
+			Location loc = Location(piece->getCentroid().coordX(),
+			                        piece->getCentroid().coordY());
+			std::pair<int, int> boardLoc = make_pair(-1, -1);
+			for(size_t i = 0; i < boardlines.size(); i++) {
+        if(boardlines[i]->perpendicularDistanceFrom(piece->getCentroid()) < gridLen/4) {
+         postStateFailure();
+         return;
+        }
+      }
+			for(int i = 0;i < 3;i++) {
+				for(int j = 0;j < 3;j++) {
+					if( boardInfo.boardLocs[i][j].dist(Location(piece->getCentroid().coordX(),piece->getCentroid().coordY())) < gridLen ) {
+						boardLoc = make_pair(i, j);
+						NEW_SHAPE(destination1, LineData, piece->getLine1());
+            NEW_SHAPE(destination2, LineData, piece->getLine2());
+            destination1->setColor("blue");
+            destination2->setColor("blue");
+            VRmixin::drawShapes.push_back(destination1);
+            VRmixin::drawShapes.push_back(destination2);
+						break;
+					}
+				}
+			}
+			pieces.push_back(PieceInfo(loc, XPiece, piece, boardLoc));
+		} END_ITERATE;
+
+
+  // find o pieces on board
+		SHAPEVEC_ITERATE(opieces, NaughtData, piece) {
+			piece->setObstacle(true);
+			piece->setLandmark(true);
+			Location loc = Location(piece->getCentroid().coordX(),
+			                        piece->getCentroid().coordY());
+			for(size_t i = 0; i < boardlines.size(); i++) {
+        if(boardlines[i]->perpendicularDistanceFrom(piece->getCentroid()) < gridLen/4) {
+         postStateFailure();
+         return;
+        }
+      }
+			std::pair<int, int> boardLoc = make_pair(-1, -1);
+			for(int i = 0;i < 3;i++) {
+				for(int j = 0;j < 3;j++) {
+					if( boardInfo.boardLocs[i][j].dist(Location(piece->getCentroid().coordX(), piece->getCentroid().coordY())) < gridLen ) {
+						boardLoc = make_pair(i, j);
+						NEW_SHAPE(destination, EllipseData, new EllipseData(camShS, Point(piece->getCentroid().coordX(), piece->getCentroid().coordY()), piece->getRadius(), piece->getRadius()));
+            destination->setColor("black");
+            VRmixin::drawShapes.push_back(destination);
+						break;
+					}
+				}
+			}
+			pieces.push_back(PieceInfo(loc, OPiece, piece, boardLoc));
+		} END_ITERATE;
+
+		Location robotLoc = Location(theAgent->getCentroid().coordX(),
+		                    theAgent->getCentroid().coordY());
+		boardState = BoardState(robotLoc, pieces);
+
+		postStateSignal<Turn>(currentTurn);
+		return;
+	}
+
+	$nodeclass FindFirstPiece : doStart {
+	  $reference TicTacToe_HR::boardInfo;
+	  $reference TicTacToe_HR::boardlines;
+	  $reference TicTacToe_HR::gridLen;
+	  $reference TicTacToe_HR::newPiece;
+
+    int cnt=0;
+  // x pieces
+		NEW_SHAPEVEC(xpieces, CrossData, select_type<CrossData>(camShS));
+
+    std::vector<Shape<CrossData> >::iterator it;
+    for( it = xpieces.begin(); it != xpieces.end(); ) {
+      for(size_t j = 0; j < boardlines.size(); j++) {
+        if(boardlines[j]->perpendicularDistanceFrom((*it)->getLine1().getCentroid()) < 5 || boardlines[j]->perpendicularDistanceFrom((*it)->getLine2().getCentroid()) < 5) {
+          (*it).deleteShape();
+          it = xpieces.erase(it);
+          break;
+        }
+        if( j == boardlines.size() - 1)
+          it++;
+      }
+    }
+
+  // o pieces
+    NEW_SHAPEVEC(opieces, NaughtData, select_type<NaughtData>(camShS));
+
+  // find x pieces on board
+		std::vector<PieceInfo> pieces;
+		SHAPEVEC_ITERATE(xpieces, CrossData, piece) {
+			for(int i = 0;i < 3;i++) {
+				for(int j = 0;j < 3;j++) {
+					if( boardInfo.boardLocs[i][j].dist(Location(piece->getCentroid().coordX(),piece->getCentroid().coordY())) < gridLen ) {
+					  cnt++;
+						newPiece = Location(piece->getCentroid().coordX(), piece->getCentroid().coordY());
+					}
+				}
+			}
+		} END_ITERATE;
+
+
+  // find o pieces on board
+		SHAPEVEC_ITERATE(opieces, NaughtData, piece) {
+			for(int i = 0;i < 3;i++) {
+				for(int j = 0;j < 3;j++) {
+					if( boardInfo.boardLocs[i][j].dist(Location(piece->getCentroid().coordX(), piece->getCentroid().coordY())) < gridLen ) {
+						cnt++;
+						newPiece = Location(piece->getCentroid().coordX(), piece->getCentroid().coordY());
+					}
+				}
+			}
+		} END_ITERATE;
+
+    if( cnt > 1 )
+      postStateFailure();
+    else if ( cnt == 0)
+      postStateCompletion();
+    else
+      postStateSuccess();
+    return;
+ }
+
+  $nodeclass MakeSureFirstPiece : doStart {
+    $reference TicTacToe_HR::board;
+    $reference TicTacToe_HR::boardState;
+    $reference TicTacToe_HR::boardInfo;
+    $reference TicTacToe_HR::boardlines;
+    $reference TicTacToe_HR::newPiece;
+    $reference TicTacToe_HR::gridLen;
+    $reference TicTacToe_HR::currentTurn;
+    $reference TicTacToe_HR::last_i;
+    $reference TicTacToe_HR::last_j;
+
+    Location tmp(0,0);
+    int ti, tj, tk;
+    int cnt = 0;
+    bool isNaught = 1; // postulation
+
+    NEW_SHAPEVEC(opieces, NaughtData, select_type<NaughtData>(camShS));
+    int const numo = opieces.size();
+    if ( numo != 0 ) {
+      for(int i = 0; i < 3; i++)
+        for(int j = 0; j < 3; j++)
+          for(size_t k = 0; k < opieces.size(); k++) {
+            if (boardInfo.boardLocs[i][j].dist(Location(opieces[k]->getCentroid().coordX(), opieces[k]->getCentroid().coordY())) < gridLen) {
+              cnt++;
+              tmp = Location(opieces[k]->getCentroid().coordX(), opieces[k]->getCentroid().coordY());
+              ti = i;
+              tj = j;
+              tk = k;
+            }
+          }
+    } else {
+      isNaught = 0;
+    }
+
+    NEW_SHAPEVEC(xpieces, CrossData, select_type<CrossData>(camShS));
+    std::vector<Shape<CrossData> >::iterator it;
+    for( it = xpieces.begin(); it != xpieces.end(); ) {
+      for(size_t j = 0; j < boardlines.size(); j++) {
+        if(boardlines[j]->perpendicularDistanceFrom((*it)->getLine1().getCentroid()) < 5 || boardlines[j]->perpendicularDistanceFrom((*it)->getLine2().getCentroid()) < 5) {
+           (*it).deleteShape();
+           it = xpieces.erase(it);
+           break;
+         }
+         if( j == boardlines.size() - 1)
+           it++;
+       }
+    }
+
+  // find x pieces on board
+    int const numx = xpieces.size();
+    if ( numx != 0 ) {
+      for(int i = 0; i < 3; i++)
+        for(int j = 0; j < 3; j++)
+          for(size_t k = 0; k < xpieces.size(); k++) {
+            if (boardInfo.boardLocs[i][j].dist(Location(xpieces[k]->getCentroid().coordX(), xpieces[k]->getCentroid().coordY())) < gridLen ) {
+                cnt++;
+                tmp = Location(xpieces[k]->getCentroid().coordX(), xpieces[k]->getCentroid().coordY());
+                ti = i;
+                tj = j;
+                tk = k;
+              }
+            }
+    }
+
+  // find if there is a new piece
+    if(cnt == 1 && newPiece.dist(tmp) < 5) {
+      if (!isNaught) {
+        VRmixin::drawShapes.clear();
+        boardState.pieces.push_back(PieceInfo(boardInfo.boardLocs[ti][tj], XPiece, ShapeRoot(), make_pair(ti, tj)));
+        NEW_SHAPE(destination1, LineData, xpieces[tk]->getLine1());
+        NEW_SHAPE(destination2, LineData, xpieces[tk]->getLine2());
+        destination1->setColor("blue");
+        destination2->setColor("blue");
+        VRmixin::drawShapes.push_back(destination1);
+        VRmixin::drawShapes.push_back(destination2);
+        board[last_i][last_j] = None;
+        board[ti][tj] = XPiece;
+        currentTurn = RobotTurn;
+        postStateSignal<Turn>(currentTurn);
+      } else {
+        if (ti==last_i && tj==last_j) {
+          VRmixin::drawShapes.clear();
+          boardState.pieces.push_back(PieceInfo(boardInfo.boardLocs[ti][tj], OPiece, ShapeRoot(), make_pair(ti, tj)));
+          NEW_SHAPE(destination, EllipseData, new EllipseData(camShS, Point(opieces[tk]->getCentroid().coordX(), opieces[tk]->getCentroid().coordY()), opieces[tk]->getRadius(), opieces[tk]->getRadius()));
+         destination->setColor("blue");
+          VRmixin::drawShapes.push_back(destination);
+          currentTurn = PlayerTurn;
+          postStateSignal<Turn>(currentTurn);
+        } else
+          postStateCompletion();
+      }
+    }
+    else
+      postStateFailure();
+    return;
+  }
+
+  $nodeclass ClearVR : doStart {
+    VRmixin::drawShapes.clear();
+  }
+
+  $nodeclass ChangeTurn : doStart {
+    $reference TicTacToe_HR::currentTurn;
+    $reference TicTacToe_HR::counter_2;
+
+    currentTurn = static_cast<Turn>(1 - currentTurn);
+    counter_2 = 0;
+  }
+
+  $nodeclass CommentOnPlayer : SpeechNode : doStart {
+    $reference TicTacToe_HR::board;
+    $reference TicTacToe_HR::last_player_i;
+		$reference TicTacToe_HR::last_player_j;
+
+    if( last_player_i==1 && last_player_j==1 )
+      textstream << " You picked the center";
+    else if ( (last_player_i==0 && (last_player_j==0 || last_player_j==2)) || (last_player_i==2 && (last_player_j==0 || last_player_j==2) ) )
+      textstream << " You picked a corner square";
+    else
+      textstream << " You picked a side squre";
+    std::vector<std::vector<BoardPiece> > fakeb = std::vector<std::vector<BoardPiece> >(3, std::vector<BoardPiece>(3));
+    fakeb = board;
+    fakeb[last_player_i][last_player_j] = OPiece;
+    if( winner(fakeb) == OPiece)
+      textstream << " to block me.";
+    postStateCompletion();
+  }
+
+  $nodeclass CheatCounter : doStart {
+    $reference TicTacToe_HR::counter_2;
+    $reference TicTacToe_HR::currentTurn;
+
+    counter_2++;
+    if( counter_2 == 3)
+      postStateSuccess();
+    else
+      postStateSignal<Turn>(currentTurn);
+  }
+
+  $nodeclass ChooseTurn : doStart {
+    $reference TicTacToe_HR::currentTurn;
+
+    postStateSignal<Turn>(currentTurn);
+  }
+
+	$nodeclass PostCompleteState : doStart {
+		// used for concurrency
+		std::cout << "State is okay" << std::endl;
+		postStateCompletion();
+	}
+
+	$setupmachine {
+		startnode : FindBoardLines =MAP=> parseBoard
+
+		parseBoard : ParseBoard
+		parseBoard =S=> clearBoardPlan
+		parseBoard =F=> SpeechNode("Wait.") =T(3000)=> StateNode
+
+		newGame: NewGame
+		newGame =N=> AIChoice =S=> DrawPiece =S=> waitForFirstMove
+
+		waitForFirstMove : FindPieces =MAP=> findFirstPiece
+
+		findFirstPiece : FindFirstPiece
+		findFirstPiece =S=> reFindFirstPiece
+		findFirstPiece =F=> SpeechNode(" Wrong Move. Try again.") =T(3000)=> waitForFirstMove
+		findFirstPiece =C=> StateNode =T(1000)=> waitForFirstMove
+
+
+		reFindFirstPiece : FindPieces =MAP=> firstMove
+
+		firstMove : MakeSureFirstPiece
+		firstMove =S<Turn>(RobotTurn)=> SpeechNode(" Ok. You want to be the first.") =C=> robotStartingSpeech
+		firstMove =S<Turn>(PlayerTurn)=> SpeechNode(" Now you can go. ") =C=> playerStartingSpeech
+		firstMove =F=> SpeechNode(" Please make the choice.") =T(1000)=> waitForFirstMove
+		firstMove =C=> SpeechNode(" Sorry, wrong place.") =T(1500)=> waitForFirstMove
+
+		clearBoardPlan : ClearBoardPlan
+    clearBoardPlan =S=> SpeechNode("Good. A clean board. Robot plays naught and you play cross. If you want to go first, you could place a cross on board. Or you could help robot place naught as it shows.") =C=> newGame
+    clearBoardPlan =F=> SpeechNode("Please help me clear the board") =C=>
+    StateNode =T(5000)=> FindBoardLines =MAP=> clearBoardPlan
+
+		readPlayerPiece : ReadPlayerPiece
+		readPlayerPiece =readPlayerPiece_Failure:F=> StateNode =TM=> readPlayerPiece
+		readPlayerPiece =readPlayerPiece_Success:S=> StateNode =T(1500)=> firstMove
+
+		firstMove1 : FirstMove
+		firstMove1 =firstmove1_player:S<Turn>(PlayerTurn)=> playerStartingSpeech
+		firstMove1 =firstmove1_robot:S<Turn>(RobotTurn)=> StateNode =T(2000)=> robotStartingSpeech
+
+		playerStartingSpeech : StateNode =T(2000)=> {readBoardPieces, playerTurnSpeech}
+
+		playerTurnSpeech : TTTCommentaryNode(TTTStatePlayerTurn)
+
+		readBoardPieces : StateNode =N=> reBuildBoard
+
+		testSkS2 : TestSkS
+		testSkS2 =S=> examinePieces
+		testSkS2 =F=> StateNode =T(450)=> testSkS2
+
+		examinePieces : ExaminePieces
+    examinePieces =F=> StateNode =T(500)=> readBoardPieces
+    examinePieces =S=> StateNode =T(1000)=> waitandcheck
+
+    waitandcheck : FindPieces =MAP=> reExaminePieces
+
+    reExaminePieces : ReExaminePieces
+    reExaminePieces =F=> readBoardPieces
+    reExaminePieces =S=> readBoardChange
+
+    //reBuildBoard : Reinit =C=> FindBoardLines =MAP=> TestSkSInit =T(250)=> testSkS3
+    reBuildBoard : Reinit =C=> FindBoardLines =MAP=> reParse
+
+    testSkS3 : TestSkS
+		testSkS3 =S=> reParse
+		testSkS3 =F=> StateNode =T(250)=> testSkS3
+
+    reParse : ParseBoard =S=> StateNode =N=> parsePieces
+    parsePieces : ParsePieces
+    parsePieces =S<Turn>(RobotTurn)=> drawPiece
+    parsePieces =S<Turn>(PlayerTurn)=> examinePieces
+    parsePieces =F=> SpeechNode("Looks like a piece intersects with a board line. Please move it. ") =T(2000)=>  chooseTurn
+
+    chooseTurn : ChooseTurn
+    chooseTurn =S<Turn>(RobotTurn)=> drawPiece
+    chooseTurn =S<Turn>(PlayerTurn)=> readBoardPieces
+
+		readBoardChange : ReadBoardChange
+		readBoardChange =readBoardChange_NoMove:S<PlayerMoveChange>(NoMove)=> TTTCommentaryNode(TTTStateWaiting) =T(2000)=> readBoardPieces
+		readBoardChange =readBoardChange_ValidMove:S<PlayerMoveChange>(ValidMove)=> CommentOnPlayer =T(2000)=> moveRefreshWaitValidMove
+		readBoardChange =readBoardChange_InvalidMove:S<PlayerMoveChange>(InvalidMove)=> cheatCounter
+
+		robotTurnSpeech : TTTCommentaryNode(TTTStateRobotTurn)
+		robotStartingSpeech : StateNode =T(1000)=> {aiChoice, robotTurnSpeech}
+
+    cheatCounter : CheatCounter
+    cheatCounter =S=> moveRefreshWaitInvalidMove
+    cheatCounter =S<Turn>(PlayerTurn)=> SpeechNode("Wait. It confuses me.") =C=> readBoardPieces
+    cheatCounter =S<Turn>(RobotTurn)=> SpeechNode("Something's wrong on the board. ") =C=> reBuildBoard
+
+		moveRefreshWaitValidMove : PostCompleteState
+		{waitTurn, moveRefreshWaitValidMove} =moveRefreshWaitValidMove_Complete:C(1)=> ChangeTurn =N=> {aiChoice, robotTurnSpeech}
+
+		moveRefreshWaitInvalidMove : PostCompleteState
+		{waitTurn, moveRefreshWaitInvalidMove} =C(1)=> TTTCommentaryNode(TTTStateInvalidState) =C=> reinit
+
+		waitTurn : WaitTurn
+		waitTurn =T(WAIT_PLAYER_MOVE_TIME)=> TTTCommentaryNode(TTTStateWaiting) =C=> waitTurn
+
+		aiChoice : AIChoice
+		aiChoice =aiChoice_Success:S=> StateNode =T(1000)=> SpeechNode("Here is my move.") =C=> drawPiece
+		aiChoice =aiChoice_Fail:F=> endGame
+
+		drawPiece : DrawPiece
+		drawPiece =S=> StateNode =T(500)=> examineRobotPieces
+		drawPiece =F=> endGame
+
+		examineRobotPieces : FindPieces =MAP=> StateNode =T(200)=> TestSkSInit =T(450)=> testSkS1
+
+		testSkS1 : TestSkS
+		testSkS1 =S=> putPieces
+		testSkS1 =F=> StateNode =T(450)=> testSkS1
+
+		putPieces : PutPiece
+		putPieces =S=> readBoardChangeRobot
+		putPieces =C=> saysomething
+		putPieces =F=> SpeechNode("That's not my move. Please take it back and try again.") =C=> StateNode =T(2000)=> reBuildBoard
+
+		readBoardChangeRobot: ReadBoardChange
+		readBoardChangeRobot =readBoardChangeRobot_ValidMove:S<PlayerMoveChange>(ValidMove)=> SpeechNode(" It doesn't seem right." ) =C=> reBuildBoard
+		readBoardChangeRobot =readBoardChangeRobot_InvalidMove:S<PlayerMoveChange>(InvalidMove)=> SpeechNode("It doesn't seem right.") =C=>cheatCounter
+		readBoardChangeRobot =readBoardChangeRobot_NoMove:S<PlayerMoveChange>(NoMove)=> SpeechNode("Thanks. Your turn.") =C=> ChangeTurn =N=> InitCounter =T(1000)=> {readBoardPieces, playerTurnSpeech}
+
+		saysomething : SaySomething
+		saysomething =S=> SpeechNode("Please help.") =T(2000)=> reBuildBoard
+		saysomething =F=> reBuildBoard
+
+		endGame : EndGame
+		endGame =C=> TTTCommentaryNode(TTTStateGameFinishedTie) =C=> endGamePrompt
+		endGame =S=> TTTCommentaryNode(TTTStateGameFinishedWin) =C=> endGamePrompt
+		endGame =F=> TTTCommentaryNode(TTTStateGameFinishedLose) =C=> endGamePrompt
+
+		endGamePrompt : EndGamePrompt
+		clearingBoardSpeech : TTTCommentaryNode(TTTStateClearingBoard)
+		endGamePrompt =T(4000)=> SpeechNode(" New game begins.") =C=> reinit
+
+		reinit : Reinit
+		reinit =C=> startnode
+	}
+}
+
+REGISTER_BEHAVIOR(TicTacToe_HR);
